@@ -950,8 +950,7 @@ class SQLPlanParserSuite extends BaseTestSuite {
     }
   }
 
-  test("get_json_object is unsupported in Project") {
-    // get_json_object is disabled by default in the RAPIDS plugin
+  test("get_json_object is supported by default in Project prior to RAPIDS 24.04") {
     TrampolineUtil.withTempDir { parquetoutputLoc =>
       TrampolineUtil.withTempDir { eventLogDir =>
         val (eventLog, _) = ToolTestUtils.generateEventLog(eventLogDir,
@@ -974,7 +973,7 @@ class SQLPlanParserSuite extends BaseTestSuite {
         }
         val execInfo = getAllExecsFromPlan(parsedPlans.toSeq)
         val projectExprs = execInfo.filter(_.exec == "Project")
-        assertSizeAndNotSupported(1, projectExprs)
+        assertSizeAndSupported(1, projectExprs)
       }
     }
   }
@@ -1616,6 +1615,113 @@ class SQLPlanParserSuite extends BaseTestSuite {
       execInfo.expr shouldEqual s"Format: unknown"
       execInfo.udf shouldBe false
       execInfo.shouldIgnore shouldBe false
+    }
+  }
+
+  test("BloomFilters are supported") {
+    // BloomFilter was added in Spark 3.3.0, but we do not care about the version here because
+    // we use one parser to rule all spark-versions.
+    // scalastyle:off line.size.limit
+    // The following two expressions are copied from the Spark explain files
+    val aggDescr = "ObjectHashAggregate(keys=[], functions=[partial_bloom_filter_agg(xxhash64(d_week_seq#41, 42), 335, 8990, 0, 0)])"
+    val filterDescr = "Filter (((isnotnull(c_customer_sk#1) AND isnotnull(c_current_addr_sk#3)) AND isnotnull(c_current_cdemo_sk#2)) AND might_contain(Subquery scalar-subquery#4, [id=#5], xxhash64(c_current_addr_sk#3, 42)))"
+    // scalastyle:on line.size.limit
+    val aggNode = ToolsPlanGraph.constructGraphNode(
+      1,
+      "ObjectHashAggregate",
+      aggDescr, Seq[SQLPlanMetric]())
+    val aggExprArr =
+      SQLPlanParser.parseAggregateExpressions(aggNode.desc.replaceFirst("ObjectHashAggregate", ""))
+    val filterNode = ToolsPlanGraph.constructGraphNode(
+      2,
+      "Filter",
+      filterDescr, Seq[SQLPlanMetric]())
+    val filterExprArray = SQLPlanParser.parseFilterExpressions(
+      filterNode.desc.replaceFirst("Filter ", ""))
+    val pluginTypeChecker = new PluginTypeChecker()
+    pluginTypeChecker.getNotSupportedExprs(aggExprArr) shouldBe 'empty
+    pluginTypeChecker.getNotSupportedExprs(filterExprArray) shouldBe 'empty
+  }
+
+  test("KnownNullable is supported") {
+    // scalastyle:off line.size.limit
+    // The following expression is copied from the Spark explain files
+    val projectDescr = "Project [named_struct(start, precisetimestampconversion(precisetimestampconversion(t#0, TimestampType, LongType), LongType, TimestampType), end, knownnullable(precisetimestampconversion(precisetimestampconversion(cast(t#0 + cast(10 minutes as interval) as timestamp), TimestampType, LongType), LongType, TimestampType))) AS session_window#0, d#0, t#0, s#0, x#0L, wt#0]"
+    // scalastyle:on line.size.limit
+    val projectNode = ToolsPlanGraph.constructGraphNode(
+      2,
+      "Project",
+      projectDescr, Seq[SQLPlanMetric]())
+    val filterExprArray = SQLPlanParser.parseFilterExpressions(
+      projectNode.desc.replaceFirst("Project ", ""))
+    val pluginTypeChecker = new PluginTypeChecker()
+    pluginTypeChecker.getNotSupportedExprs(filterExprArray) shouldBe 'empty
+  }
+
+  runConditionalTest("WindowGroupLimitExec is supported", execsSupportedSparkGTE350) {
+    val windowGroupLimitExecCmd = "WindowGroupLimit"
+    val tbl_name = "foobar_tbl"
+    TrampolineUtil.withTempDir { eventLogDir =>
+      withTable(tbl_name) {
+        val (eventLog, _) = ToolTestUtils.generateEventLog(eventLogDir,
+          windowGroupLimitExecCmd) { spark =>
+          spark.sql(s"CREATE TABLE $tbl_name (foo STRING, bar STRING) USING PARQUET")
+          val query =
+            s"""
+            SELECT foo, bar FROM (
+                SELECT foo, bar,
+                    RANK() OVER (PARTITION BY foo ORDER BY bar) as rank
+                FROM $tbl_name)
+            WHERE rank <= 2"""
+          spark.sql(query)
+        }
+        val pluginTypeChecker = new PluginTypeChecker()
+        val app = createAppFromEventlog(eventLog)
+        val parsedPlans = app.sqlPlans.map { case (sqlID, plan) =>
+          SQLPlanParser.parseSQLPlan(app.appId, plan, sqlID, "", pluginTypeChecker, app)
+        }
+        val allExecInfo = getAllExecsFromPlan(parsedPlans.toSeq)
+        val windowGroupLimitExecs = allExecInfo.filter(_.exec.contains(windowGroupLimitExecCmd))
+        // We should have two WindowGroupLimitExec operators (Partial and Final).
+        assertSizeAndSupported(2, windowGroupLimitExecs)
+      }
+    }
+  }
+
+  runConditionalTest("row_number in WindowGroupLimitExec is not supported",
+    execsSupportedSparkGTE350) {
+    val windowGroupLimitExecCmd = "WindowGroupLimit"
+    val tbl_name = "foobar_tbl"
+    TrampolineUtil.withTempDir { eventLogDir =>
+      withTable(tbl_name) {
+        val (eventLog, _) = ToolTestUtils.generateEventLog(eventLogDir,
+          windowGroupLimitExecCmd) { spark =>
+          spark.sql(s"CREATE TABLE $tbl_name (foo STRING, bar STRING) USING PARQUET")
+          val query =
+            s"""
+            SELECT foo, bar FROM (
+                SELECT foo, bar,
+                    ROW_NUMBER() OVER (PARTITION BY foo ORDER BY bar) as rank
+                FROM $tbl_name)
+            WHERE rank <= 2"""
+          spark.sql(query)
+        }
+        val pluginTypeChecker = new PluginTypeChecker()
+        val app = createAppFromEventlog(eventLog)
+        val parsedPlans = app.sqlPlans.map { case (sqlID, plan) =>
+          SQLPlanParser.parseSQLPlan(app.appId, plan, sqlID, "", pluginTypeChecker, app)
+        }
+        val allExecInfo = getAllExecsFromPlan(parsedPlans.toSeq)
+        val windowExecNotSupportedExprs = allExecInfo.filter(
+          _.exec.contains(windowGroupLimitExecCmd)).flatMap(x => x.unsupportedExprs)
+        windowExecNotSupportedExprs.head.exprName shouldEqual "row_number"
+        windowExecNotSupportedExprs.head.unsupportedReason shouldEqual
+            "Ranking function row_number is not supported in WindowGroupLimitExec"
+        val windowGroupLimitExecs = allExecInfo.filter(_.exec.contains(windowGroupLimitExecCmd))
+        // We should have two WindowGroupLimitExec operators (Partial and Final) which are
+        // not supported due to unsupported expression.
+        assertSizeAndNotSupported(2, windowGroupLimitExecs)
+      }
     }
   }
 }
