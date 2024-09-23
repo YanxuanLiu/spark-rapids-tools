@@ -23,6 +23,7 @@
 
 # Get the build mode argument
 build_mode="$1"
+echo 'hello'
 
 # get the directory of the script
 WORK_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}"; )" &> /dev/null && pwd 2> /dev/null; )";
