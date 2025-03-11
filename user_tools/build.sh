@@ -22,6 +22,8 @@
 # Finally performs the default build process.
 
 # Get the build mode argument
+
+
 build_mode="$1"
 
 # get the directory of the script
